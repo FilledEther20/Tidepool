@@ -1,0 +1,40 @@
+# Example ingestion config for enterprise_banking_ledger (see schema_db.sql)
+# Format csv_name: db_name
+mapping:
+  txn_id: txn_id
+  account_id: account_id
+  client_id: client_id
+  txn_type: txn_type
+  amount: amount
+  currency: currency
+  status: status
+  channel: channel
+  merchant_category_code: merchant_category_code
+  device_ip: device_ip
+  lat: geo_lat
+  long: geo_long
+  risk_sc: risk_score
+  aml_flag: aml_flag
+  fee: fee
+  updated_balance: balance_after
+  started_at: initiated_at
+  cleared_at: cleared_at
+  raw_metadata: raw_metadata
+
+on_conflict:
+  target:
+    - txn_id
+  update:
+    status: status
+    cleared_at: cleared_at
+    updated_balance: balance_after
+
+target:
+  schema: public
+  table_name: enterprise_banking_ledger
+
+runtime:
+  max_parameters: 65535 # postgres limit
+  max_failure_rate: 0.05
+  max_consecutive_failures: 100
+  min_failure_sample: 100

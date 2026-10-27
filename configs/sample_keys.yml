@@ -1,0 +1,17 @@
+# Allowed YAML key tree for ingestion config. A "*" entry permits any key at that map level
+# (e.g. CSV column names under mapping and on_conflict.update).
+
+mapping:
+  "*": {}
+on_conflict:
+  target: {}
+  update:
+    "*": {}
+target:
+  schema: {}
+  table_name: {}
+runtime:
+  max_parameters: {}
+  max_failure_rate: {}
+  max_consecutive_failures: {}
+  min_failure_sample: {}

@@ -12,13 +12,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const defaultMinFailureSample = 100
+const (
+	defaultMaxParameters          = 65535
+	defaultMaxFailureRate         = 0.05
+	defaultMaxConsecutiveFailures = 100
+	defaultMinFailureSample       = 100
+)
 
 type Config struct {
 	Mapping  map[string]string `yaml:"mapping"`
 	ToUpdate OnConflict        `yaml:"on_conflict"`
 	Target   Target            `yaml:"target"`
 	Runtime  Runtime           `yaml:"runtime"`
+
+	Bindings        []Binding        `yaml:"-"`
+	RequiredHeaders []string         `yaml:"-"`
+	Schema          *TableDefinition `yaml:"-"`
 }
 
 // OnConflict describes the upsert related target and columns to update
@@ -73,8 +82,8 @@ var scalarFields = []struct {
 	{"runtime", "min_failure_sample", intTag},
 }
 
-// Load strictly decodes the ingestion config; semantic validation happens later.
-func Load(configPath, allowedKeysPath string) (*Config, error) {
+// Load strictly decodes and validates the ingestion config against its table definition.
+func Load(configPath, allowedKeysPath, schemaPath string) (*Config, error) {
 	rawConfig, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, configError(fmt.Sprintf("read config: %v", err))
@@ -87,6 +96,10 @@ func Load(configPath, allowedKeysPath string) (*Config, error) {
 	_, allowed, err := parseYAMLTree(rawKeys, "allowed keys")
 	if err != nil {
 		return nil, err
+	}
+	rawSchema, err := os.ReadFile(schemaPath)
+	if err != nil {
+		return nil, configError(fmt.Sprintf("read schema: %v", err))
 	}
 
 	root, tree, err := parseYAMLTree(rawConfig, "config")
@@ -104,10 +117,58 @@ func Load(configPath, allowedKeysPath string) (*Config, error) {
 	if err := root.Decode(&cfg); err != nil {
 		return nil, configError(fmt.Sprintf("decode config: %v", err))
 	}
-	if section, _ := tree["runtime"].(map[string]interface{}); section["min_failure_sample"] == nil {
-		cfg.Runtime.MinFailureSample = defaultMinFailureSample
+	applyRuntimeDefaults(&cfg.Runtime, tree)
+	if err := applyTargetOverrides(&cfg.Target); err != nil {
+		return nil, err
+	}
+	cfg.Schema, err = parseSchema(rawSchema)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateConfig(&cfg); err != nil {
+		return nil, err
+	}
+	cfg.Bindings = orderedBindings(cfg.Mapping, cfg.Schema)
+	cfg.RequiredHeaders = make([]string, len(cfg.Bindings))
+	for i, binding := range cfg.Bindings {
+		cfg.RequiredHeaders[i] = binding.CSVHeader
 	}
 	return &cfg, nil
+}
+
+func applyRuntimeDefaults(runtime *Runtime, tree map[string]interface{}) {
+	section, _ := tree["runtime"].(map[string]interface{})
+	if section["max_parameters"] == nil {
+		runtime.MaxParameters = defaultMaxParameters
+	}
+	if section["max_failure_rate"] == nil {
+		runtime.MaxFailureRate = defaultMaxFailureRate
+	}
+	if section["max_consecutive_failures"] == nil {
+		runtime.MaxConsecutiveFailures = defaultMaxConsecutiveFailures
+	}
+	if section["min_failure_sample"] == nil {
+		runtime.MinFailureSample = defaultMinFailureSample
+	}
+}
+
+func applyTargetOverrides(target *Target) error {
+	if value, ok := os.LookupEnv("INGESTION_SCHEMA"); ok {
+		if value == "" {
+			return configError("INGESTION_SCHEMA cannot be empty")
+		}
+		target.Schema = value
+	}
+	if value, ok := os.LookupEnv("INGESTION_TABLE"); ok {
+		if value == "" {
+			return configError("INGESTION_TABLE cannot be empty")
+		}
+		target.TableName = value
+	}
+	if target.Schema == "" {
+		target.Schema = "public"
+	}
+	return nil
 }
 
 // parseYAMLTree parses exactly one mapping document into nested maps, lists and scalar nodes.
@@ -123,6 +184,9 @@ func parseYAMLTree(raw []byte, role string) (*yaml.Node, map[string]interface{},
 	var extra yaml.Node
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return nil, nil, configError(role + " must contain exactly one YAML document")
+	}
+	if len(doc.Content) == 0 {
+		return nil, nil, configError(role + " is empty")
 	}
 
 	root := doc.Content[0]

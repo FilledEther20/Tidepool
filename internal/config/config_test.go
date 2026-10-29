@@ -10,6 +10,7 @@ import (
 
 const sampleIngestion = "../../configs/sample_ingestion.yml"
 const sampleKeys = "../../configs/sample_keys.yml"
+const sampleSchema = "../../schema_db.sql"
 
 func writeTemp(t *testing.T, name, content string) string {
 	t.Helper()
@@ -30,7 +31,7 @@ on_conflict:
     amt: amount
 target:
   schema: public
-  table_name: ledger
+  table_name: enterprise_banking_ledger
 runtime:
   max_parameters: 1000
   max_failure_rate: 0.05
@@ -39,7 +40,7 @@ runtime:
 `
 
 func TestLoadSampleConfig(t *testing.T) {
-	cfg, err := Load(sampleIngestion, sampleKeys)
+	cfg, err := Load(sampleIngestion, sampleKeys, sampleSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,6 +60,12 @@ func TestLoadSampleConfig(t *testing.T) {
 	if cfg.Runtime != want {
 		t.Errorf("runtime = %+v; want %+v", cfg.Runtime, want)
 	}
+	if got := cfg.BatchRowLimit(); got != 3449 {
+		t.Errorf("BatchRowLimit() = %d; want 3449", got)
+	}
+	if len(cfg.RequiredHeaders) != 19 || cfg.RequiredHeaders[0] != "account_id" {
+		t.Errorf("unexpected required headers: %v", cfg.RequiredHeaders)
+	}
 }
 
 func TestLoadMinFailureSample(t *testing.T) {
@@ -74,12 +81,12 @@ func TestLoadMinFailureSample(t *testing.T) {
 		{"explicit value", validConfig, 50, false},
 		{"omitted defaults", omitted, 100, false},
 		{"missing runtime section defaults", noRuntime, 100, false},
-		{"explicit zero kept", strings.Replace(validConfig, "min_failure_sample: 50", "min_failure_sample: 0", 1), 0, false},
+		{"explicit zero rejected", strings.Replace(validConfig, "min_failure_sample: 50", "min_failure_sample: 0", 1), 0, true},
 		{"explicit null rejected", strings.Replace(validConfig, "min_failure_sample: 50", "min_failure_sample:", 1), 0, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := Load(writeTemp(t, "c.yml", tc.config), keys)
+			cfg, err := Load(writeTemp(t, "c.yml", tc.config), keys, sampleSchema)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("expected error")
@@ -97,7 +104,7 @@ func TestLoadMinFailureSample(t *testing.T) {
 }
 
 func TestLoadFloatAcceptsInteger(t *testing.T) {
-	cfg, err := Load(writeTemp(t, "c.yml", strings.Replace(validConfig, "0.05", "1", 1)), sampleKeys)
+	cfg, err := Load(writeTemp(t, "c.yml", strings.Replace(validConfig, "0.05", "1", 1)), sampleKeys, sampleSchema)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +151,7 @@ func TestLoadRejections(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			cfg, err := Load(writeTemp(t, "c.yml", tc.config), sampleKeys)
+			cfg, err := Load(writeTemp(t, "c.yml", tc.config), sampleKeys, sampleSchema)
 			if err == nil {
 				t.Fatalf("expected error containing %q", tc.wantSubstr)
 			}
@@ -166,12 +173,13 @@ func TestLoadFileErrors(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing.yml")
 	cfg := writeTemp(t, "c.yml", validConfig)
 
-	for name, paths := range map[string][2]string{
-		"missing config": {missing, sampleKeys},
-		"missing keys":   {cfg, missing},
+	for name, paths := range map[string][3]string{
+		"missing config": {missing, sampleKeys, sampleSchema},
+		"missing keys":   {cfg, missing, sampleSchema},
+		"missing schema": {cfg, sampleKeys, missing},
 	} {
 		t.Run(name, func(t *testing.T) {
-			got, err := Load(paths[0], paths[1])
+			got, err := Load(paths[0], paths[1], paths[2])
 			var ce *ConfigError
 			if got != nil || !errors.As(err, &ce) || ce.Code != "CONFIG" {
 				t.Fatalf("got %v, %v", got, err)
@@ -190,10 +198,66 @@ func TestLoadRejectsBadWhitelist(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			got, err := Load(cfg, writeTemp(t, "k.yml", tc.keys))
+			got, err := Load(cfg, writeTemp(t, "k.yml", tc.keys), sampleSchema)
 			if got != nil || err == nil || !strings.Contains(err.Error(), tc.wantSubstr) {
 				t.Fatalf("got %v, %v; want error containing %q", got, err, tc.wantSubstr)
 			}
 		})
+	}
+}
+
+func TestLoadSemanticValidation(t *testing.T) {
+	mutations := map[string]struct{ old, new, want string }{
+		"unknown destination":   {"amt: amount", "amt: missing", `unknown schema column "missing"`},
+		"duplicate destination": {"amt: amount", "amt: txn_id", "both target column"},
+		"invalid conflict key":  {"- txn_id", "- amount", "must match a declared"},
+		"update mismatch":       {"  update:\n    amt: amount", "  update:\n    amt: txn_id", "must match an insert mapping pair"},
+		"zero failure sample":   {"min_failure_sample: 50", "min_failure_sample: 0", "must be positive"},
+		"zero parameter limit":  {"max_parameters: 1000", "max_parameters: 0", "between 1 and"},
+		"too few parameters":    {"max_parameters: 1000", "max_parameters: 1", "too small for one mapped row"},
+		"invalid failure rate":  {"max_failure_rate: 0.05", "max_failure_rate: 1.1", "at most 1"},
+		"wrong table":           {"table_name: enterprise_banking_ledger", "table_name: another_table", "does not match schema table"},
+	}
+	for name, mutation := range mutations {
+		t.Run(name, func(t *testing.T) {
+			doc := strings.Replace(validConfig, mutation.old, mutation.new, 1)
+			cfg, err := Load(writeTemp(t, "c.yml", doc), sampleKeys, sampleSchema)
+			if err == nil || cfg != nil || !strings.Contains(err.Error(), mutation.want) {
+				t.Fatalf("got config=%v err=%v; want error containing %q", cfg, err, mutation.want)
+			}
+		})
+	}
+}
+
+func TestLoadEnvironmentOverrides(t *testing.T) {
+	t.Setenv("INGESTION_SCHEMA", "archive")
+	t.Setenv("INGESTION_TABLE", "enterprise_banking_ledger")
+	cfg, err := Load(writeTemp(t, "c.yml", validConfig), sampleKeys, sampleSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Target.Schema != "archive" || cfg.Target.TableName != "enterprise_banking_ledger" {
+		t.Fatalf("overrides not applied: %+v", cfg.Target)
+	}
+}
+
+func TestLoadRejectsEmptyEnvironmentOverride(t *testing.T) {
+	t.Setenv("INGESTION_SCHEMA", "")
+	if cfg, err := Load(writeTemp(t, "c.yml", validConfig), sampleKeys, sampleSchema); cfg != nil || err == nil {
+		t.Fatalf("got config=%v err=%v; expected empty override error", cfg, err)
+	}
+}
+
+func TestErrorsPath(t *testing.T) {
+	cases := map[string]string{
+		"/data/ledger.v1.csv": "/data/ledger.v1_errors.csv",
+		"/data/ledger":        "/data/ledger_errors.csv",
+		"/data/.ledger":       "/data/.ledger_errors.csv",
+		"/data/ledger.csv.gz": "/data/ledger.csv_errors.csv",
+	}
+	for input, want := range cases {
+		if got := ErrorsPath(input); got != want {
+			t.Errorf("ErrorsPath(%q) = %q; want %q", input, got, want)
+		}
 	}
 }
